@@ -139,31 +139,61 @@ impl GpuContext {
 
 impl GpuEngine {
     /// Try to initialize the GPU engine with the given batch size.
-    pub fn try_new(batch_size: u64) -> Result<Self, Box<dyn std::error::Error>> {
-        block_on(Self::init(batch_size))
+    ///
+    /// `max_devices`:
+    ///   - `None`  — auto-detect: use every discrete GPU. If none exist, fall back to the
+    ///     single best non-discrete adapter (integrated / virtual). This avoids dragging
+    ///     a discrete GPU down with a much slower integrated one on hybrid systems.
+    ///   - `Some(n)` — initialize at most `n` adapters, picked from the ranked list of
+    ///     deduplicated physical GPUs (discrete preferred over integrated).
+    pub fn try_new(
+        batch_size: u64,
+        max_devices: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        block_on(Self::init(batch_size, max_devices))
     }
 
-    async fn init(batch_size: u64) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn init(
+        batch_size: u64,
+        max_devices: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         log::info!(target: "gpu_engine", "Initializing WGPU...");
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
-        let adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY);
-
-        // Collect adapters to a vector to check count and iterate with index
-        let adapters: Vec<_> = adapters.into_iter().collect();
+        let adapters: Vec<_> = instance
+            .enumerate_adapters(wgpu::Backends::PRIMARY)
+            .into_iter()
+            .collect();
 
         if adapters.is_empty() {
             log::error!(target: "gpu_engine", "No suitable GPU adapters found.");
             return Err("No suitable GPU adapters found".into());
         }
 
+        let selected = select_adapters(adapters, max_devices);
+
+        if selected.is_empty() {
+            log::error!(target: "gpu_engine", "No usable GPU adapters after filtering.");
+            return Err("No usable GPU adapters found".into());
+        }
+
         let mut contexts = Vec::new();
         let mut adapter_infos = Vec::new();
-        for (i, adapter) in adapters.into_iter().enumerate() {
+        for (i, adapter) in selected.into_iter().enumerate() {
             let info = adapter.get_info();
+            log::info!(
+                target: "gpu_engine",
+                "Using GPU {}: '{}' ({:?}, backend={:?}, vendor=0x{:04X}, device=0x{:04X})",
+                i,
+                info.name,
+                info.device_type,
+                info.backend,
+                info.vendor,
+                info.device,
+            );
             log::debug!(target: "gpu_engine", "Adapter {} raw info: {:?}", i, info);
             adapter_infos.push(info.clone());
 
@@ -598,6 +628,168 @@ fn run_single_batch(
     }
 }
 
+/// Rank for a device type. Lower = better.
+fn device_type_rank(t: wgpu::DeviceType) -> u8 {
+    match t {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::VirtualGpu => 1,
+        wgpu::DeviceType::IntegratedGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
+}
+
+/// Rank for a backend when the same physical GPU is exposed across multiple backends.
+/// Lower = preferred. Native APIs first, with the platform default for that GPU's OS chosen first.
+fn backend_rank(b: wgpu::Backend) -> u8 {
+    match b {
+        wgpu::Backend::Metal => 0,
+        wgpu::Backend::Vulkan => 1,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 3,
+        wgpu::Backend::BrowserWebGpu => 4,
+        wgpu::Backend::Noop => 5,
+    }
+}
+
+/// Filter, deduplicate, and rank GPU adapters.
+///
+/// On Windows in particular, `enumerate_adapters(Backends::PRIMARY)` returns the same
+/// physical GPU twice (DX12 and Vulkan), and hybrid laptops also expose the integrated
+/// GPU. Without filtering, worker threads round-robin across all of them — landing on the
+/// slow integrated GPU or duplicating work on the discrete GPU under two backends.
+///
+/// This function:
+///   1. Drops software (`Cpu`) adapters.
+///   2. Deduplicates by `(vendor, device, name)` so each physical GPU appears once,
+///      preferring the most native backend (Metal > Vulkan > DX12 > GL).
+///   3. Sorts by device type (discrete > virtual > integrated > other).
+///   4. When `max_devices` is `None`, prefers discrete GPUs exclusively when any exist,
+///      otherwise falls back to the single best non-discrete adapter.
+///   5. When `max_devices` is `Some(n)`, returns the top `n` from the ranked list.
+fn select_adapters(
+    adapters: Vec<wgpu::Adapter>,
+    max_devices: Option<usize>,
+) -> Vec<wgpu::Adapter> {
+    let entries: Vec<(wgpu::AdapterInfo, wgpu::Adapter)> =
+        adapters.into_iter().map(|a| (a.get_info(), a)).collect();
+    let kept_indices = select_adapter_indices(entries.iter().map(|(i, _)| i), max_devices);
+    let mut by_index: Vec<Option<(wgpu::AdapterInfo, wgpu::Adapter)>> =
+        entries.into_iter().map(Some).collect();
+    kept_indices
+        .into_iter()
+        .filter_map(|i| by_index[i].take().map(|(_, a)| a))
+        .collect()
+}
+
+/// Apply the adapter-selection policy and return the original indices of the chosen
+/// adapters, in the order they should be initialized.
+///
+/// Separated from `select_adapters` so it can be unit-tested with synthetic
+/// `AdapterInfo` values — `wgpu::Adapter` cannot be constructed without a real GPU.
+fn select_adapter_indices<'a>(
+    infos: impl IntoIterator<Item = &'a wgpu::AdapterInfo>,
+    max_devices: Option<usize>,
+) -> Vec<usize> {
+    let infos: Vec<&wgpu::AdapterInfo> = infos.into_iter().collect();
+
+    log::info!(
+        target: "gpu_engine",
+        "Detected {} GPU adapter(s) before filtering:",
+        infos.len()
+    );
+    for (i, info) in infos.iter().enumerate() {
+        log::info!(
+            target: "gpu_engine",
+            "  [{}] '{}' type={:?} backend={:?} vendor=0x{:04X} device=0x{:04X}",
+            i,
+            info.name,
+            info.device_type,
+            info.backend,
+            info.vendor,
+            info.device,
+        );
+    }
+
+    // 1. Drop software (Cpu) adapters — software renderers like llvmpipe or WARP pose
+    //    as GPUs but mining on them is pointless and skews worker distribution.
+    let mut kept: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter_map(|(i, info)| {
+            if info.device_type == wgpu::DeviceType::Cpu {
+                log::info!(
+                    target: "gpu_engine",
+                    "Skipping software adapter: '{}' ({:?}, backend={:?})",
+                    info.name, info.device_type, info.backend,
+                );
+                None
+            } else {
+                Some(i)
+            }
+        })
+        .collect();
+
+    // 2. Sort by (device_type rank, backend rank, name) so the best representative of
+    //    each physical GPU sorts first and survives dedup.
+    kept.sort_by(|&a, &b| {
+        let ia = infos[a];
+        let ib = infos[b];
+        device_type_rank(ia.device_type)
+            .cmp(&device_type_rank(ib.device_type))
+            .then_with(|| backend_rank(ia.backend).cmp(&backend_rank(ib.backend)))
+            .then_with(|| ia.name.cmp(&ib.name))
+    });
+
+    // 3. Dedupe by (vendor, device, name) so a physical GPU exposed on multiple
+    //    backends (e.g. DX12 + Vulkan on Windows) appears once.
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<usize> = Vec::with_capacity(kept.len());
+    for i in kept {
+        let info = infos[i];
+        let key = (info.vendor, info.device, info.name.clone());
+        if seen.insert(key) {
+            deduped.push(i);
+        } else {
+            log::info!(
+                target: "gpu_engine",
+                "Skipping duplicate adapter on alternate backend: '{}' ({:?})",
+                info.name, info.backend,
+            );
+        }
+    }
+
+    // 4. Apply the auto-detect vs explicit selection policy.
+    match max_devices {
+        None => {
+            let has_discrete = deduped
+                .iter()
+                .any(|&i| infos[i].device_type == wgpu::DeviceType::DiscreteGpu);
+            if has_discrete {
+                deduped
+                    .into_iter()
+                    .filter(|&i| {
+                        let info = infos[i];
+                        if info.device_type == wgpu::DeviceType::DiscreteGpu {
+                            true
+                        } else {
+                            log::info!(
+                                target: "gpu_engine",
+                                "Auto-detect: skipping non-discrete GPU '{}' ({:?}). Pass --gpu-devices to include it explicitly.",
+                                info.name, info.device_type,
+                            );
+                            false
+                        }
+                    })
+                    .collect()
+            } else {
+                deduped.into_iter().take(1).collect()
+            }
+        }
+        Some(n) => deduped.into_iter().take(n).collect(),
+    }
+}
+
 /// Get vendor-specific optimal dispatch configuration
 fn get_vendor_specific_dispatch(adapter_info: &wgpu::AdapterInfo, device: &wgpu::Device) -> u32 {
     let limits = device.limits();
@@ -877,4 +1069,112 @@ fn get_vendor_specific_dispatch(adapter_info: &wgpu::AdapterInfo, device: &wgpu:
     }
 
     optimal_workgroups
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn info(
+        name: &str,
+        device_type: wgpu::DeviceType,
+        backend: wgpu::Backend,
+        vendor: u32,
+        device: u32,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor,
+            device,
+            device_type,
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+        }
+    }
+
+    // Hybrid laptop: NVIDIA discrete + Intel integrated, both exposed on DX12 and Vulkan.
+    // Auto-detect must keep only the discrete GPU, on its preferred backend, once.
+    #[test]
+    fn auto_detect_prefers_discrete_and_dedupes_backends() {
+        let infos = [
+            info("Intel UHD Graphics", wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Dx12, 0x8086, 0x1),
+            info("Intel UHD Graphics", wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Vulkan, 0x8086, 0x1),
+            info("NVIDIA RTX 4090", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12, 0x10DE, 0x2684),
+            info("NVIDIA RTX 4090", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2684),
+        ];
+        let picked = select_adapter_indices(infos.iter(), None);
+        assert_eq!(picked.len(), 1, "auto-detect should pick exactly one device");
+        let chosen = &infos[picked[0]];
+        assert_eq!(chosen.device_type, wgpu::DeviceType::DiscreteGpu);
+        assert_eq!(chosen.backend, wgpu::Backend::Vulkan);
+    }
+
+    // Explicit --gpu-devices 1 on a hybrid laptop must still pick the discrete GPU,
+    // not whichever happened to be first in enumerate_adapters() order.
+    #[test]
+    fn explicit_one_device_picks_discrete_over_integrated() {
+        let infos = [
+            info("Intel UHD Graphics", wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Vulkan, 0x8086, 0x1),
+            info("NVIDIA RTX 4090", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2684),
+        ];
+        let picked = select_adapter_indices(infos.iter(), Some(1));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(infos[picked[0]].device_type, wgpu::DeviceType::DiscreteGpu);
+    }
+
+    // Two discrete GPUs: auto-detect keeps both. Order is sort-stable but irrelevant.
+    #[test]
+    fn auto_detect_keeps_all_discrete() {
+        let infos = [
+            info("NVIDIA RTX 4090", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2684),
+            info("AMD RX 7900 XTX", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x1002, 0x744C),
+        ];
+        let picked = select_adapter_indices(infos.iter(), None);
+        assert_eq!(picked.len(), 2);
+        for &i in &picked {
+            assert_eq!(infos[i].device_type, wgpu::DeviceType::DiscreteGpu);
+        }
+    }
+
+    // Integrated-only system (no discrete): auto-detect must still produce a working device.
+    #[test]
+    fn auto_detect_falls_back_to_integrated_when_no_discrete() {
+        let infos = [info(
+            "Intel UHD Graphics",
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::Backend::Vulkan,
+            0x8086,
+            0x1,
+        )];
+        let picked = select_adapter_indices(infos.iter(), None);
+        assert_eq!(picked.len(), 1);
+    }
+
+    // Software adapters (llvmpipe / WARP) must always be dropped — mining on them is useless.
+    #[test]
+    fn cpu_adapters_are_skipped() {
+        let infos = [
+            info("llvmpipe", wgpu::DeviceType::Cpu, wgpu::Backend::Vulkan, 0x10005, 0x0),
+            info("NVIDIA RTX 4090", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2684),
+        ];
+        let picked = select_adapter_indices(infos.iter(), None);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(infos[picked[0]].device_type, wgpu::DeviceType::DiscreteGpu);
+    }
+
+    // Explicit --gpu-devices N caps the result even with many physical GPUs available.
+    #[test]
+    fn explicit_caps_to_requested_count() {
+        let infos = [
+            info("NVIDIA RTX 4090 #1", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2684),
+            info("NVIDIA RTX 4090 #2", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan, 0x10DE, 0x2685),
+            info("Intel UHD Graphics", wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Vulkan, 0x8086, 0x1),
+        ];
+        let picked = select_adapter_indices(infos.iter(), Some(2));
+        assert_eq!(picked.len(), 2);
+        for &i in &picked {
+            assert_eq!(infos[i].device_type, wgpu::DeviceType::DiscreteGpu);
+        }
+    }
 }
