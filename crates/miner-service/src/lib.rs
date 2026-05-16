@@ -420,9 +420,8 @@ pub fn resolve_gpu_configuration(
         return Ok((None, 0));
     }
 
-    // Initialize the GPU engine with the requested device cap so we don't open contexts
-    // for adapters we won't use (e.g. the integrated GPU on a hybrid laptop).
-    let engine = engine_gpu::GpuEngine::try_new(batch_size, requested_devices);
+    // Try to initialize GPU engine
+    let engine = engine_gpu::GpuEngine::try_new(batch_size);
     let engine = match engine {
         Ok(e) => e,
         Err(e) => {
@@ -438,7 +437,7 @@ pub fn resolve_gpu_configuration(
     let count = match requested_devices {
         Some(n) if n > available => {
             anyhow::bail!(
-                "Requested {} GPU devices but only {} usable adapter(s) available",
+                "Requested {} GPU devices but only {} available",
                 n,
                 available
             );
