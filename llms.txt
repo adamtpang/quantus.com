@@ -1,0 +1,17 @@
+# Quantus Miner (quantus.com)
+
+> A high-performance external miner for the Quantus Network, run from one command across CPU, GPU, or both.
+
+This is a Rust workspace that builds `quantus-miner`, a service that connects to a Quantus Network node over a QUIC protocol, receives mining jobs, and returns proof-of-work results. It supports CPU-only, GPU-only, and hybrid CPU+GPU mining, with cross-platform GPU acceleration via WGPU (Metal on macOS, Vulkan/OpenGL on Linux, DirectX 12/Vulkan on Windows) and optional Prometheus metrics.
+
+It is for people running or testing Quantus Network mining, including anyone speedrunning testnet QUAN. This repo is Adam's working fork of the upstream Quantus-Network miner: it is engine code and a CLI, not a website. There is no hosted app here, you build and run the binary yourself.
+
+## Key links
+- [Home](https://quantus.com/): landing for the Quantus Network project this miner serves.
+- [README](https://github.com/adamtpang/quantus.com/blob/main/README.md): build, run, GPU setup, Docker, and benchmarking instructions.
+- [External miner protocol](https://github.com/adamtpang/quantus.com/blob/main/EXTERNAL_MINER_PROTOCOL.md): the QUIC-based NewJob/JobResult message spec.
+- [Upstream project](https://github.com/Quantus-Network/quantus-miner): the canonical Quantus Network miner this fork tracks.
+
+## About
+- Part of adam.inc, the internet portfolio of Adam Pangelinan (Anchor Marianas LLC).
+- Builder: https://adampang.com
